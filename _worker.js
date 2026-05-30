@@ -33,7 +33,7 @@ export default {
           }
         }
       } catch (e) {
-        // Jika gagal konek ke GitHub, abaikan agar tidak crash
+        // Abaikan jika github bermasalah
       }
 
       const countryPathMatch = url.pathname.match(/^\/([a-zA-Z]{2})(\d*)$/);
@@ -54,7 +54,6 @@ export default {
             selectedProxy = filteredProxies[targetIndex] || filteredProxies[targetIndex % filteredProxies.length];
           }
 
-          // PERBAIKAN: Variabel sudah diarahkan dengan benar ke 'selectedProxy'
           if (selectedProxy) {
             globalThis.PROXY_IP = selectedProxy.prxIP;
             globalThis.PROXY_PORT = selectedProxy.prxPort;
@@ -102,7 +101,7 @@ export default {
 };
 
 // =========================================================
-// CORE PROTOCOL HANDLER
+// MULTI-PROTOCOL HANDLER (VLESS, VMESS, TROJAN)
 // =========================================================
 async function multiProtocolHandler(request) {
   const webSocketPair = new WebSocketPair();
@@ -111,9 +110,21 @@ async function multiProtocolHandler(request) {
 
   let remoteSocket = null;
 
+  // Membuat penanganan aliran data byte stream yang aman untuk WebSocket
   const readableStream = new ReadableStream({
     start(controller) {
-      webSocket.addEventListener("message", event => controller.enqueue(event.data));
+      webSocket.addEventListener("message", event => {
+        // PROTEKSI: Memastikan data yang dimasukkan ke stream diubah ke Uint8Array murni
+        let data = event.data;
+        if (typeof data === "string") {
+          data = new TextEncoder().encode(data);
+        } else if (data instanceof ArrayBuffer) {
+          data = new Uint8Array(data);
+        } else if (!(data instanceof Uint8Array)) {
+          data = new Uint8Array(data);
+        }
+        controller.enqueue(data);
+      });
       webSocket.addEventListener("close", () => safeClose(webSocket));
       webSocket.addEventListener("error", () => safeClose(webSocket));
     }
@@ -121,14 +132,18 @@ async function multiProtocolHandler(request) {
 
   readableStream.pipeTo(new WritableStream({
     async write(chunk) {
+      // Pastikan chunk dalam format Uint8Array murni sebelum dikirim ke socket outbound
+      const buffer = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+
       if (remoteSocket) {
         const writer = remoteSocket.writable.getWriter();
-        await writer.write(chunk);
+        await writer.write(buffer);
         writer.releaseLock();
         return;
       }
 
-      const buffer = new Uint8Array(chunk);
+      if (buffer.length === 0) return;
+
       let isTrojan = false;
       let isVless = false;
 
@@ -150,9 +165,14 @@ async function multiProtocolHandler(request) {
           webSocket.send(new Uint8Array([0, 0, 0x0d, 0x0a])); 
         }
 
+        // Jalankan pompa data balik dari proxy server ke client WebSocket
         remoteSocket.readable.pipeTo(new WritableStream({
-          write(data) {
-            if (webSocket.readyState === 1) webSocket.send(data);
+          async write(data) {
+            if (webSocket.readyState === 1) {
+              // Konversi ke ArrayBuffer sebelum dilempar balik ke v2rayNG lewat WebSocket
+              const arrayBuffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+              webSocket.send(arrayBuffer);
+            }
           },
           close() { safeClose(webSocket); },
           abort() { safeClose(webSocket); }
