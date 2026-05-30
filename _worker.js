@@ -10,12 +10,12 @@ export default {
       const path = url.pathname.toLowerCase();
       const finalUUID = env.UUID || DEFAULT_UUID;
 
-      // 1. LIVE FETCH: Ambil data proxy langsung dari GitHub secara real-time
+      // 1. LIVE FETCH: Mengambil data proxy dari GitHub dengan Cache 1 Jam
       let proxyList = [];
       try {
         const response = await fetch(GITHUB_PROXY_URL, { 
           headers: { "User-Agent": "Cloudflare Worker" },
-          cf: { cacheEverything: true, cacheTtl: 3600 } // Cloudflare otomatis cache file ini selama 1 jam
+          cf: { cacheEverything: true, cacheTtl: 3600 } 
         });
         if (response.status === 200) {
           const text = await response.text();
@@ -33,7 +33,7 @@ export default {
           }
         }
       } catch (e) {
-        // Jika GitHub down, proxyList akan kosong dan rute luar akan fallback ke Cloudflare IP
+        // Jika gagal konek ke GitHub, abaikan agar tidak crash
       }
 
       const countryPathMatch = url.pathname.match(/^\/([a-zA-Z]{2})(\d*)$/);
@@ -54,6 +54,7 @@ export default {
             selectedProxy = filteredProxies[targetIndex] || filteredProxies[targetIndex % filteredProxies.length];
           }
 
+          // PERBAIKAN: Variabel sudah diarahkan dengan benar ke 'selectedProxy'
           if (selectedProxy) {
             globalThis.PROXY_IP = selectedProxy.prxIP;
             globalThis.PROXY_PORT = selectedProxy.prxPort;
@@ -74,10 +75,10 @@ export default {
         });
       }
 
-      // Halaman Utama: Menampilkan list proxy hasil parse live
+      // Halaman Utama: List Proxy Terurai
       if (path === "/") {
         if (proxyList.length === 0) {
-          return new Response("Gagal memuat data dari GitHub.", { status: 500 });
+          return new Response("Gagal memuat data dari GitHub atau data kosong.", { status: 500 });
         }
         const viewLines = [];
         const countryCounter = {};
@@ -98,11 +99,10 @@ export default {
       return new Response(`Error: ${err.toString()}`, { status: 500 });
     }
   }
-  // Menghapus fungsi 'scheduled' karena sudah tidak memerlukan sinkronisasi Cron ke KV
 };
 
 // =========================================================
-// CORES & HANDLER (VLESS, VMESS, TROJAN)
+// CORE PROTOCOL HANDLER
 // =========================================================
 async function multiProtocolHandler(request) {
   const webSocketPair = new WebSocketPair();
