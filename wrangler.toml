@@ -1,0 +1,6 @@
+name = "xray_server"
+main = "_worker.js"
+compatibility_date = "2026-05-30"
+
+[vars]
+UUID = "00000000-0000-0000-0000-000000000000"
