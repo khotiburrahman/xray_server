@@ -5,12 +5,10 @@ export default {
     try {
       const upgradeHeader = request.headers.get("Upgrade");
       if (upgradeHeader === "websocket") {
-        console.log("[DEBUG] Menerima koneksi WebSocket baru");
         return await websocketHandler(request);
       }
       return new Response("Worker VLESS & Trojan Direct Aktif.", { status: 200 });
     } catch (err) {
-      console.log("[ERROR] Fetch error:", err.toString());
       return new Response(`Error: ${err.toString()}`, { status: 500 });
     }
   }
@@ -27,34 +25,38 @@ async function websocketHandler(request) {
 
   readableWebSocketStream.pipeTo(new WritableStream({
     async write(chunk) {
+      // 1. NORMALISASI CHUNK
+      // Memastikan chunk selalu menjadi ArrayBuffer untuk mencegah error DataView
+      let buffer;
+      if (chunk instanceof ArrayBuffer) {
+        buffer = chunk;
+      } else if (chunk instanceof Uint8Array) {
+        buffer = chunk.buffer;
+      } else if (typeof chunk === "string") {
+        buffer = new TextEncoder().encode(chunk).buffer;
+      } else if (chunk && typeof chunk.arrayBuffer === "function") {
+        buffer = await chunk.arrayBuffer(); // Handle Blob
+      } else {
+        buffer = new Uint8Array(chunk).buffer;
+      }
+
       if (remoteSocketWrapper.value) {
         const writer = remoteSocketWrapper.value.writable.getWriter();
-        await writer.write(chunk);
+        await writer.write(buffer);
         writer.releaseLock();
         return;
       }
 
-      console.log(`[DEBUG] Chunk diterima, ukuran: ${chunk.byteLength} bytes`);
-      const protocol = protocolSniffer(chunk);
-      console.log(`[DEBUG] Protokol terdeteksi: ${protocol}`);
-      
+      const protocol = protocolSniffer(buffer);
       let headerData;
-      if (protocol === "trojan") headerData = readHorseHeader(chunk);
-      else headerData = readNekoHeader(chunk);
 
-      if (headerData.hasError) {
-        console.log("[ERROR] Gagal membaca header/payload VPN.");
+      if (protocol === "trojan") headerData = readHorseHeader(buffer);
+      else headerData = readNekoHeader(buffer);
+
+      if (headerData.hasError || !headerData.addressRemote) {
         webSocket.close();
         return;
       }
-      
-      if (!headerData.addressRemote) {
-        console.log("[ERROR] Alamat tujuan kosong/gagal diekstrak.");
-        webSocket.close();
-        return;
-      }
-
-      console.log(`[DEBUG] Ekstraksi Sukses -> Tujuan: ${headerData.addressRemote}:${headerData.portRemote}`);
 
       await handleTCPOutBound(
         remoteSocketWrapper,
@@ -65,33 +67,31 @@ async function websocketHandler(request) {
         headerData.version
       );
     },
-    close() {
-        console.log("[DEBUG] WebSocket dari client ditutup.");
-    },
-    abort(err) {
-        console.log("[ERROR] WebSocket abort:", err);
-    },
-  })).catch((err) => {
-      console.log("[ERROR] Pipe stream error:", err);
-  });
+    close() {},
+    abort() {},
+  })).catch(() => {});
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
 function protocolSniffer(buffer) {
+  if (buffer.byteLength < 1) return "vless";
   const view = new Uint8Array(buffer);
   if (view[0] === 0) return "vless";
-  if (buffer.byteLength >= 56 && view[56] === 0x0d && view[57] === 0x0a) return "trojan";
+  if (buffer.byteLength >= 58 && view[56] === 0x0d && view[57] === 0x0a) return "trojan";
   return "vless";
 }
 
 function readNekoHeader(buffer) {
   try {
+    if (buffer.byteLength < 18) return { hasError: true }; // Cek batas aman ukuran VLESS
+    
     const viewUint8 = new Uint8Array(buffer);
     const version = viewUint8[0];
     const optLength = viewUint8[17];
     const portIndex = 18 + optLength + 1; 
     
+    if (buffer.byteLength < portIndex + 2) return { hasError: true };
     const dataView = new DataView(buffer);
     const portRemote = dataView.getUint16(portIndex, false);
     
@@ -118,7 +118,6 @@ function readNekoHeader(buffer) {
         addressValue = ipv6.join(":");
         break;
       default:
-        console.log(`[ERROR] VLESS AddressType tidak dikenal: ${addressType}`);
         return { hasError: true };
     }
 
@@ -130,14 +129,16 @@ function readNekoHeader(buffer) {
       version: new Uint8Array([version, 0])
     };
   } catch (e) {
-    console.log("[ERROR] Exception VLESS Header:", e.message);
     return { hasError: true };
   }
 }
 
 function readHorseHeader(buffer) {
   try {
+    if (buffer.byteLength < 58) return { hasError: true }; // Cek batas aman ukuran Trojan
     const dataBuffer = buffer.slice(58);
+    if (dataBuffer.byteLength < 4) return { hasError: true };
+    
     const viewUint8 = new Uint8Array(dataBuffer);
     const dataView = new DataView(dataBuffer);
     
@@ -163,11 +164,11 @@ function readHorseHeader(buffer) {
         addressValue = ipv6.join(":");
         break;
       default:
-         console.log(`[ERROR] Trojan AddressType tidak dikenal: ${addressType}`);
         return { hasError: true };
     }
 
     const portIndex = addressValueIndex + addressLength;
+    if (dataBuffer.byteLength < portIndex + 2) return { hasError: true };
     const portRemote = dataView.getUint16(portIndex, false);
     
     return {
@@ -178,20 +179,17 @@ function readHorseHeader(buffer) {
       version: null
     };
   } catch (e) {
-    console.log("[ERROR] Exception Trojan Header:", e.message);
     return { hasError: true };
   }
 }
 
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader) {
   try {
-    console.log(`[DEBUG] Mencoba TCP connect ke -> ${addressRemote}:${portRemote}`);
     const tcpSocket = connect({ hostname: addressRemote, port: portRemote });
     remoteSocket.value = tcpSocket;
     const writer = tcpSocket.writable.getWriter();
     await writer.write(rawClientData);
     writer.releaseLock();
-    console.log(`[DEBUG] Berhasil mengirim payload ke ${addressRemote}`);
 
     let header = responseHeader;
     tcpSocket.readable.pipeTo(new WritableStream({
@@ -205,12 +203,10 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
           }
         }
       }
-    })).catch((err) => {
-      console.log(`[ERROR] Koneksi TCP terputus dari ${addressRemote}`);
+    })).catch(() => {
       if (webSocket.readyState === 1) webSocket.close();
     });
   } catch (e) {
-    console.log(`[ERROR] Gagal connect TCP ke ${addressRemote}`);
     if (webSocket.readyState === 1) webSocket.close();
   }
 }
@@ -227,14 +223,14 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
         if (readableStreamCancel) return;
         controller.close();
       });
-      webSocketServer.addEventListener("error", (err) => {
-          console.log("[ERROR] WebSocket server error:", err);
-          controller.error(err);
-      });
+      webSocketServer.addEventListener("error", (err) => controller.error(err));
 
       if (earlyDataHeader) {
         try {
-          const decode = atob(earlyDataHeader.replace(/-/g, "+").replace(/_/g, "/"));
+          // Penyesuaian decode jika earlyData dikirim berdampingan dengan nama protokol
+          const parts = earlyDataHeader.split(",");
+          const base64Str = (parts.length > 1 ? parts[1].trim() : parts[0].trim()).replace(/-/g, "+").replace(/_/g, "/");
+          const decode = atob(base64Str);
           controller.enqueue(Uint8Array.from(decode, (c) => c.charCodeAt(0)).buffer);
         } catch (e) {}
       }
