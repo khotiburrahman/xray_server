@@ -191,20 +191,16 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     await writer.write(rawClientData);
     writer.releaseLock();
 
-    let header = responseHeader;
+    // [PERBAIKAN] Langsung kirim header approval VLESS ke klien secara instan
+    if (responseHeader && webSocket.readyState === 1) {
+      webSocket.send(responseHeader);
+    }
+
+    // Teruskan sisa data stream murni
     tcpSocket.readable.pipeTo(new WritableStream({
-      write(chunk) { // Sinkron, sangat cepat untuk membalas ke WS
+      write(chunk) {
         if (webSocket.readyState === 1) { 
-          if (header) {
-            const chunkView = new Uint8Array(chunk);
-            const combined = new Uint8Array(header.length + chunkView.length);
-            combined.set(header, 0);
-            combined.set(chunkView, header.length);
-            webSocket.send(combined);
-            header = null;
-          } else {
-            webSocket.send(chunk);
-          }
+          webSocket.send(chunk);
         }
       }
     })).catch(() => {
@@ -214,6 +210,7 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     if (webSocket.readyState === 1) webSocket.close();
   }
 }
+
 
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
   let readableStreamCancel = false;
