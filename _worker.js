@@ -28,6 +28,11 @@ export default {
     } catch (err) {
       return new Response(`Error: ${err.toString()}`, { status: 500 });
     }
+  },
+
+  // Fungsi tambahan untuk update otomatis via Cron Triggers
+  async scheduled(event, env, ctx) {
+    await handleSync(ctx);
   }
 };
 
@@ -70,7 +75,7 @@ async function handleSync(ctx) {
       const oldDomainText = oldDomain ? await oldDomain.text() : "";
 
       if (newDomainText !== oldDomainText) {
-        // Tetap simpan meskipun kosong (jika kosong, semua langsung via Cloudflare)
+        // Tetap simpan meskipun kosong
         const cacheResp = new Response(newDomainText, { headers: { "Cache-Control": "max-age=31536000" } });
         ctx.waitUntil(cache.put(reqDomain, cacheResp));
         dStatus = "Berhasil diperbarui";
@@ -117,12 +122,14 @@ async function getCachedData() {
           ip: parts[0],
           port: parts[1],
           cc: parts[2],
-          org: parts.slice(3).join(",") || "Unknown" // Menggabungkan kembali jika ada koma di nama org
+          org: parts.slice(3).join(",") || "Unknown"
         };
       }
       return null;
-    }).filter(Boolean)
-      .filter(p => ["SG", "ID", "MY"].includes(p.cc.toUpperCase()));
+    })
+    .filter(Boolean)
+    // Filter negara ditambahkan di sini
+    .filter(p => ["SG", "ID", "MY"].includes(p.cc.toUpperCase()));
 
   const domains = dText.split("\n")
     .map(l => l.trim().toLowerCase())
@@ -137,12 +144,10 @@ async function handleDashboard() {
   const { proxies, domains } = await getCachedData();
   let output = "";
 
-  // Tampilkan Proxy (Format: CC IP Port Org)
   proxies.forEach(p => {
     output += `${p.cc} ${p.ip} ${p.port} ${p.org}\n`;
   });
 
-  // Tampilkan Domain
   output += "\n=======================\nDOMAIN YANG DI-ROUTE:\n=======================\n";
   if (domains.length === 0) {
     output += "(Kosong - Semua rute ditangani langsung oleh Cloudflare)\n";
@@ -193,16 +198,13 @@ async function websocketHandler(request, ctx) {
         return;
       }
 
-      // -- LOGIC ROUTING PROXY --
       const { proxies, domains } = await getCachedData();
       let targetHost = headerData.addressRemote;
       let targetPort = headerData.portRemote;
 
-      // Cek pencocokan domain
       const isDomainBlocked = domains.some(domain => targetHost.toLowerCase().endsWith(domain));
 
       if (isDomainBlocked && proxies.length > 0) {
-        // Pilih proxy acak
         const randomProxy = proxies[Math.floor(Math.random() * proxies.length)];
         targetHost = randomProxy.ip;
         targetPort = parseInt(randomProxy.port, 10);
