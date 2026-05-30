@@ -7,7 +7,7 @@ export default {
       if (upgradeHeader === "websocket") {
         return await websocketHandler(request);
       }
-      return new Response("Worker VLESS & Trojan Direct (Tanpa Proxy) Aktif.", { status: 200 });
+      return new Response("Worker VLESS & Trojan Direct Aktif.", { status: 200 });
     } catch (err) {
       return new Response(`Error: ${err.toString()}`, { status: 500 });
     }
@@ -38,7 +38,10 @@ async function websocketHandler(request) {
       if (protocol === "trojan") headerData = readHorseHeader(chunk);
       else headerData = readNekoHeader(chunk);
 
-      if (headerData.hasError) throw new Error("Header invalid");
+      if (headerData.hasError || !headerData.addressRemote) {
+        webSocket.close();
+        return;
+      }
 
       handleTCPOutBound(
         remoteSocketWrapper,
@@ -57,47 +60,56 @@ async function websocketHandler(request) {
 }
 
 function protocolSniffer(buffer) {
-  if (buffer.byteLength >= 56) {
-    const delim = new Uint8Array(buffer.slice(56, 60));
-    if (delim[0] === 0x0d && delim[1] === 0x0a) return "trojan";
-  }
+  const view = new Uint8Array(buffer);
+  // VLESS selalu diawali dengan byte 0 (versi)
+  if (view[0] === 0) return "vless";
+  // Trojan selalu memiliki \r\n di index 56-57 setelah hash password
+  if (buffer.byteLength >= 56 && view[56] === 0x0d && view[57] === 0x0a) return "trojan";
   return "vless";
 }
 
 function readNekoHeader(buffer) {
   try {
-    const version = new Uint8Array(buffer.slice(0, 1));
-    const optLength = new Uint8Array(buffer.slice(17, 18))[0];
-    const portIndex = 18 + optLength + 1;
-    const portRemote = new DataView(buffer.slice(portIndex, portIndex + 2)).getUint16(0);
+    const viewUint8 = new Uint8Array(buffer);
+    const version = viewUint8[0];
+    const optLength = viewUint8[17];
+    const portIndex = 18 + optLength + 1; // Melewati byte command
+    
+    const dataView = new DataView(buffer);
+    const portRemote = dataView.getUint16(portIndex, false);
+    
     let addressIndex = portIndex + 2;
-    const addressType = buffer[addressIndex];
+    const addressType = viewUint8[addressIndex];
     let addressLength = 0, addressValueIndex = addressIndex + 1, addressValue = "";
 
     switch (addressType) {
-      case 1:
+      case 1: // IPv4
         addressLength = 4;
-        addressValue = new Uint8Array(buffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
+        addressValue = viewUint8.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
         break;
-      case 2:
-        addressLength = buffer[addressValueIndex];
+      case 2: // Domain
+        addressLength = viewUint8[addressValueIndex];
         addressValueIndex += 1;
         addressValue = new TextDecoder().decode(buffer.slice(addressValueIndex, addressValueIndex + addressLength));
         break;
-      case 3:
+      case 3: // IPv6
         addressLength = 16;
-        const dataView = new DataView(buffer.slice(addressValueIndex, addressValueIndex + addressLength));
         const ipv6 = [];
-        for (let i = 0; i < 8; i++) ipv6.push(dataView.getUint16(i * 2).toString(16));
+        for (let i = 0; i < 8; i++) {
+          ipv6.push(dataView.getUint16(addressValueIndex + i * 2, false).toString(16));
+        }
         addressValue = ipv6.join(":");
         break;
+      default:
+        return { hasError: true };
     }
+
     return {
       hasError: false,
       addressRemote: addressValue,
       portRemote,
       rawClientData: buffer.slice(addressValueIndex + addressLength),
-      version: new Uint8Array([version[0], 0])
+      version: new Uint8Array([version, 0])
     };
   } catch (e) {
     return { hasError: true };
@@ -106,36 +118,43 @@ function readNekoHeader(buffer) {
 
 function readHorseHeader(buffer) {
   try {
-    const dataBuffer = buffer.slice(58);
-    const view = new DataView(dataBuffer);
-    let addressType = view.getUint8(1), addressLength = 0, addressValueIndex = 2, addressValue = "";
+    const dataBuffer = buffer.slice(58); // Melewati password (56) + \r\n (2)
+    const viewUint8 = new Uint8Array(dataBuffer);
+    const dataView = new DataView(dataBuffer);
+    
+    let addressType = viewUint8[1];
+    let addressLength = 0, addressValueIndex = 2, addressValue = "";
 
     switch (addressType) {
-      case 1:
+      case 1: // IPv4
         addressLength = 4;
-        addressValue = new Uint8Array(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength)).join(".");
+        addressValue = viewUint8.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
         break;
-      case 3:
-        addressLength = dataBuffer[addressValueIndex];
+      case 3: // Domain
+        addressLength = viewUint8[addressValueIndex];
         addressValueIndex += 1;
         addressValue = new TextDecoder().decode(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
         break;
-      case 4:
+      case 4: // IPv6
         addressLength = 16;
-        const dataView = new DataView(dataBuffer.slice(addressValueIndex, addressValueIndex + addressLength));
         const ipv6 = [];
-        for (let i = 0; i < 8; i++) ipv6.push(dataView.getUint16(i * 2).toString(16));
+        for (let i = 0; i < 8; i++) {
+          ipv6.push(dataView.getUint16(addressValueIndex + i * 2, false).toString(16));
+        }
         addressValue = ipv6.join(":");
         break;
+      default:
+        return { hasError: true };
     }
+
     const portIndex = addressValueIndex + addressLength;
-    const portRemote = new DataView(dataBuffer.slice(portIndex, portIndex + 2)).getUint16(0);
+    const portRemote = dataView.getUint16(portIndex, false);
     
     return {
       hasError: false,
       addressRemote: addressValue,
       portRemote,
-      rawClientData: dataBuffer.slice(portIndex + 4),
+      rawClientData: dataBuffer.slice(portIndex + 4), // Melewati port (2) + \r\n (2)
       version: null
     };
   } catch (e) {
@@ -154,7 +173,7 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     let header = responseHeader;
     tcpSocket.readable.pipeTo(new WritableStream({
       async write(chunk) {
-        if (webSocket.readyState === 1) { // WS_READY_STATE_OPEN
+        if (webSocket.readyState === 1) { 
           if (header) {
             webSocket.send(await new Blob([header, chunk]).arrayBuffer());
             header = null;
