@@ -1,126 +1,165 @@
 import { connect } from "cloudflare:sockets";
 
-const PROXY_LIST_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/active_proxies.txt";
-const BYPASS_DOMAIN_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/blocked_domain.txt";
+const PROXY_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/active_proxies.txt";
+const BLOCKED_DOMAINS_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/blocked_domain.txt";
 
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
     try {
-      const upgradeHeader = request.headers.get("Upgrade");
       const url = new URL(request.url);
+      const upgradeHeader = request.headers.get("Upgrade");
 
+      // 1. Endpoint Sinkronisasi Data
       if (url.pathname === "/sync") {
-        const syncResult = await forceSync();
-        return new Response(`Sync Berhasil!\n\n${syncResult}`, { status: 200 });
+        return await handleSync(ctx);
       }
 
-      const rawProxies = await getCachedData(PROXY_LIST_URL, "proxy-cache");
-      const rawDomains = await getCachedData(BYPASS_DOMAIN_URL, "domain-cache");
+      // 2. Halaman Dashboard
+      if (url.pathname === "/" && upgradeHeader !== "websocket") {
+        return await handleDashboard();
+      }
 
-      const proxies = parseProxyList(rawProxies);
-      const bypassDomains = parseBypassDomains(rawDomains);
-
+      // 3. Routing WebSocket
       if (upgradeHeader === "websocket") {
-        return await websocketHandler(request, proxies, bypassDomains, url.pathname);
-      }
-      
-      if (url.pathname === "/") {
-        return new Response(generateDashboard(proxies, bypassDomains), { 
-          status: 200,
-          headers: { "Content-Type": "text/html; charset=utf-8" }
-        });
+        return await websocketHandler(request, ctx);
       }
 
-      return new Response("Not Found", { status: 404 });
+      return new Response("Worker VLESS & Trojan Direct Aktif.", { status: 200 });
     } catch (err) {
       return new Response(`Error: ${err.toString()}`, { status: 500 });
     }
   }
 };
 
-async function getCachedData(targetUrl, cacheKeyName, force = false) {
-  const cache = caches.default;
-  const cacheKey = new Request(`https://fake-host.local/${cacheKeyName}`);
-  
-  if (!force) {
-    let response = await cache.match(cacheKey);
-    if (response) return await response.text();
-  }
+// --- FUNGSI CACHE & SYNC ---
 
+async function handleSync(ctx) {
+  const cache = caches.default;
+  const reqProxy = new Request(PROXY_URL);
+  const reqDomain = new Request(BLOCKED_DOMAINS_URL);
+
+  let pStatus = "Gagal (Menggunakan cache lama)";
+  let dStatus = "Gagal (Menggunakan cache lama)";
+
+  // Update Proxy
   try {
-    const req = await fetch(targetUrl);
-    if (req.ok) {
-      const text = await req.text();
-      const responseToCache = new Response(text, {
-        headers: { "Cache-Control": "public, max-age=3600" } 
-      });
-      await cache.put(cacheKey, responseToCache);
-      return text;
+    const resProxy = await fetch(PROXY_URL);
+    if (resProxy.ok) {
+      const newProxyText = await resProxy.text();
+      const oldProxy = await cache.match(reqProxy);
+      const oldProxyText = oldProxy ? await oldProxy.text() : "";
+
+      if (newProxyText.trim().length > 0) {
+        if (newProxyText !== oldProxyText) {
+          const cacheResp = new Response(newProxyText, { headers: { "Cache-Control": "max-age=31536000" } });
+          ctx.waitUntil(cache.put(reqProxy, cacheResp));
+          pStatus = "Berhasil diperbarui";
+        } else {
+          pStatus = "Identik (Menggunakan cache lama)";
+        }
+      }
     }
   } catch (e) {}
-  
-  let staleResponse = await cache.match(cacheKey);
-  return staleResponse ? await staleResponse.text() : "";
+
+  // Update Domain
+  try {
+    const resDomain = await fetch(BLOCKED_DOMAINS_URL);
+    if (resDomain.ok) {
+      const newDomainText = await resDomain.text();
+      const oldDomain = await cache.match(reqDomain);
+      const oldDomainText = oldDomain ? await oldDomain.text() : "";
+
+      if (newDomainText !== oldDomainText) {
+        // Tetap simpan meskipun kosong (jika kosong, semua langsung via Cloudflare)
+        const cacheResp = new Response(newDomainText, { headers: { "Cache-Control": "max-age=31536000" } });
+        ctx.waitUntil(cache.put(reqDomain, cacheResp));
+        dStatus = "Berhasil diperbarui";
+      } else {
+        dStatus = "Identik (Menggunakan cache lama)";
+      }
+    }
+  } catch (e) {}
+
+  return new Response(JSON.stringify({
+    proxy_status: pStatus,
+    domain_status: dStatus
+  }, null, 2), {
+    headers: { "Content-Type": "application/json" }
+  });
 }
 
-async function forceSync() {
-  const p = await getCachedData(PROXY_LIST_URL, "proxy-cache", true);
-  const d = await getCachedData(BYPASS_DOMAIN_URL, "domain-cache", true);
-  
-  const proxyCount = parseProxyList(p).length;
-  const domainCount = parseBypassDomains(d).length;
-  return `Total Proxy Diperbarui: ${proxyCount}\nTotal Domain Dialihkan Diperbarui: ${domainCount}`;
-}
+async function getCachedData() {
+  const cache = caches.default;
+  let pText = "", dText = "";
 
-function parseProxyList(text) {
-  if (!text) return [];
-  return text.split('\n')
-    .map(line => line.trim())
-    .filter(line => line && line.includes(','))
-    .map(line => {
-      const [ip, port, cc, org] = line.split(',');
-      return { ip, port: parseInt(port), cc: cc.toUpperCase(), org };
-    });
-}
-
-function parseBypassDomains(text) {
-  if (!text) return [];
-  return text.split('\n')
-    .map(line => line.trim().toLowerCase())
-    .filter(line => line && !line.startsWith('#')); 
-}
-
-function generateDashboard(proxies, domains) {
-  let html = `<html><head><title>Dashboard Proxy & Pengalihan</title><style>body{font-family:sans-serif;padding:20px}table{border-collapse:collapse;width:100%;margin-bottom:20px}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background-color:#f2f2f2}</style></head><body>`;
-  html += `<h2>Dashboard Kaftakahira</h2>`;
-  html += `<p>Total Proxy: <b>${proxies.length}</b> | Total Domain Dialihkan: <b>${domains.length}</b></p>`;
-  html += `<p><a href="/sync" target="_blank"><button style="padding:10px;cursor:pointer;">Sync Data Sekarang</button></a></p>`;
-  
-  html += `<h3>Daftar Proxy Aktif</h3>`;
-  if (proxies.length === 0) {
-    html += `<p><i>Tidak ada proxy aktif saat ini.</i></p>`;
-  } else {
-    html += `<table><tr><th>IP</th><th>Port</th><th>Kode Negara</th><th>ISP / Org</th></tr>`;
-    proxies.forEach(p => {
-      html += `<tr><td>${p.ip}</td><td>${p.port}</td><td>${p.cc}</td><td>${p.org}</td></tr>`;
-    });
-    html += `</table>`;
+  const pCache = await cache.match(new Request(PROXY_URL));
+  if (pCache) pText = await pCache.text();
+  else {
+    const r = await fetch(PROXY_URL);
+    if (r.ok) pText = await r.text();
   }
 
-  html += `<h3>Daftar Domain Dialihkan (Auto-Proxy)</h3>`;
+  const dCache = await cache.match(new Request(BLOCKED_DOMAINS_URL));
+  if (dCache) dText = await dCache.text();
+  else {
+    const r = await fetch(BLOCKED_DOMAINS_URL);
+    if (r.ok) dText = await r.text();
+  }
+
+  // Format array proxy & domain
+  const proxies = pText.split("\n")
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+    .map(l => {
+      const parts = l.split(",");
+      if (parts.length >= 3) {
+        return {
+          ip: parts[0],
+          port: parts[1],
+          cc: parts[2],
+          org: parts.slice(3).join(",") || "Unknown" // Menggabungkan kembali jika ada koma di nama org
+        };
+      }
+      return null;
+    }).filter(Boolean);
+
+  const domains = dText.split("\n")
+    .map(l => l.trim().toLowerCase())
+    .filter(l => l.length > 0 && !l.startsWith("#"));
+
+  return { proxies, domains };
+}
+
+// --- DASHBOARD ---
+
+async function handleDashboard() {
+  const { proxies, domains } = await getCachedData();
+  let output = "";
+
+  // Tampilkan Proxy (Format: CC IP Port Org)
+  proxies.forEach(p => {
+    output += `${p.cc} ${p.ip} ${p.port} ${p.org}\n`;
+  });
+
+  // Tampilkan Domain
+  output += "\n=======================\nDOMAIN YANG DI-ROUTE:\n=======================\n";
   if (domains.length === 0) {
-    html += `<p><i>Tidak ada domain yang diatur untuk dialihkan saat ini.</i></p>`;
+    output += "(Kosong - Semua rute ditangani langsung oleh Cloudflare)\n";
   } else {
-    html += `<div style="column-count:3;font-size:14px;"><ul>`;
-    domains.forEach(d => { html += `<li>${d}</li>`; });
-    html += `</ul></div>`;
+    domains.forEach(d => {
+      output += `${d}\n`;
+    });
   }
-  html += `</body></html>`;
-  
-  return html;
+
+  return new Response(output, { 
+    status: 200, 
+    headers: { "Content-Type": "text/plain; charset=utf-8" } 
+  });
 }
 
-async function websocketHandler(request, proxies, bypassDomains, pathname) {
+// --- WEBSOCKET & ROUTING CORE ---
+
+async function websocketHandler(request, ctx) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
@@ -131,7 +170,12 @@ async function websocketHandler(request, proxies, bypassDomains, pathname) {
 
   readableWebSocketStream.pipeTo(new WritableStream({
     async write(chunk) {
-      let view = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk instanceof ArrayBuffer ? chunk : await chunk.arrayBuffer());
+      let view;
+      if (chunk instanceof Uint8Array) view = chunk;
+      else if (chunk instanceof ArrayBuffer) view = new Uint8Array(chunk);
+      else if (typeof chunk === "string") view = new TextEncoder().encode(chunk);
+      else if (chunk && typeof chunk.arrayBuffer === "function") view = new Uint8Array(await chunk.arrayBuffer());
+      else view = new Uint8Array(chunk);
 
       if (remoteSocketWrapper.value) {
         const writer = remoteSocketWrapper.value.writable.getWriter();
@@ -148,29 +192,28 @@ async function websocketHandler(request, proxies, bypassDomains, pathname) {
         return;
       }
 
-      let selectedProxy = null;
-      const requestedCC = pathname.replace('/', '').toUpperCase();
-      const isBypassTarget = bypassDomains.some(domain => headerData.addressRemote.toLowerCase().includes(domain));
+      // -- LOGIC ROUTING PROXY --
+      const { proxies, domains } = await getCachedData();
+      let targetHost = headerData.addressRemote;
+      let targetPort = headerData.portRemote;
 
-      // PERBAIKAN LOGIKA DI SINI
-      if (requestedCC && requestedCC !== "" && requestedCC !== "SYNC") {
-        // Cek apakah input (misal SG1) diawali dengan kode proxy (misal SG)
-        const filteredProxies = proxies.filter(p => requestedCC.startsWith(p.cc));
-        if (filteredProxies.length > 0) {
-          selectedProxy = filteredProxies[Math.floor(Math.random() * filteredProxies.length)];
-        }
-      } else if (isBypassTarget && proxies.length > 0) {
-        selectedProxy = proxies[Math.floor(Math.random() * proxies.length)];
+      // Cek pencocokan domain
+      const isDomainBlocked = domains.some(domain => targetHost.toLowerCase().endsWith(domain));
+
+      if (isDomainBlocked && proxies.length > 0) {
+        // Pilih proxy acak
+        const randomProxy = proxies[Math.floor(Math.random() * proxies.length)];
+        targetHost = randomProxy.ip;
+        targetPort = parseInt(randomProxy.port, 10);
       }
 
       await handleTCPOutBound(
         remoteSocketWrapper,
-        headerData.addressRemote,
-        headerData.portRemote,
+        targetHost,
+        targetPort,
         headerData.rawClientData,
         webSocket,
-        headerData.version,
-        selectedProxy
+        headerData.version
       );
     },
     close() {},
@@ -191,27 +234,44 @@ function readNekoHeader(view) {
     const version = view[0];
     const optLength = view[17];
     const portIndex = 18 + optLength + 1; 
+
     if (view.length < portIndex + 2) return { hasError: true };
-    
     const portRemote = (view[portIndex] << 8) | view[portIndex + 1];
+
     let addressIndex = portIndex + 2;
     const addressType = view[addressIndex];
     let addressLength = 0, addressValueIndex = addressIndex + 1, addressValue = "";
 
     switch (addressType) {
       case 1:
-        addressLength = 4; addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join("."); break;
+        addressLength = 4;
+        if (view.length < addressValueIndex + addressLength) return { hasError: true };
+        addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
+        break;
       case 2:
-        addressLength = view[addressValueIndex]; addressValueIndex += 1;
-        addressValue = new TextDecoder().decode(view.slice(addressValueIndex, addressValueIndex + addressLength)); break;
+        addressLength = view[addressValueIndex];
+        addressValueIndex += 1;
+        if (view.length < addressValueIndex + addressLength) return { hasError: true };
+        addressValue = new TextDecoder().decode(view.slice(addressValueIndex, addressValueIndex + addressLength));
+        break;
       case 3:
-        addressLength = 16; const ipv6 = [];
+        addressLength = 16;
+        if (view.length < addressValueIndex + addressLength) return { hasError: true };
+        const ipv6 = [];
         for (let i = 0; i < 8; i++) ipv6.push(((view[addressValueIndex + i * 2] << 8) | view[addressValueIndex + i * 2 + 1]).toString(16));
-        addressValue = ipv6.join(":"); break;
-      default: return { hasError: true };
+        addressValue = ipv6.join(":");
+        break;
+      default:
+        return { hasError: true };
     }
 
-    return { hasError: false, addressRemote: addressValue, portRemote, rawClientData: view.slice(addressValueIndex + addressLength), version: new Uint8Array([version, 0]) };
+    return {
+      hasError: false,
+      addressRemote: addressValue,
+      portRemote,
+      rawClientData: view.slice(addressValueIndex + addressLength),
+      version: new Uint8Array([version, 0])
+    };
   } catch (e) { return { hasError: true }; }
 }
 
@@ -226,32 +286,44 @@ function readHorseHeader(viewAll) {
 
     switch (addressType) {
       case 1:
-        addressLength = 4; addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join("."); break;
+        addressLength = 4;
+        if (view.length < addressValueIndex + addressLength) return { hasError: true };
+        addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
+        break;
       case 3:
-        addressLength = view[addressValueIndex]; addressValueIndex += 1;
-        addressValue = new TextDecoder().decode(view.slice(addressValueIndex, addressValueIndex + addressLength)); break;
+        addressLength = view[addressValueIndex];
+        addressValueIndex += 1;
+        if (view.length < addressValueIndex + addressLength) return { hasError: true };
+        addressValue = new TextDecoder().decode(view.slice(addressValueIndex, addressValueIndex + addressLength));
+        break;
       case 4:
-        addressLength = 16; const ipv6 = [];
+        addressLength = 16;
+        if (view.length < addressValueIndex + addressLength) return { hasError: true };
+        const ipv6 = [];
         for (let i = 0; i < 8; i++) ipv6.push(((view[addressValueIndex + i * 2] << 8) | view[addressValueIndex + i * 2 + 1]).toString(16));
-        addressValue = ipv6.join(":"); break;
-      default: return { hasError: true };
+        addressValue = ipv6.join(":");
+        break;
+      default:
+        return { hasError: true };
     }
 
     const portIndex = addressValueIndex + addressLength;
+    if (view.length < portIndex + 2) return { hasError: true };
     const portRemote = (view[portIndex] << 8) | view[portIndex + 1];
 
-    return { hasError: false, addressRemote: addressValue, portRemote, rawClientData: view.slice(portIndex + 4), version: null };
+    return {
+      hasError: false,
+      addressRemote: addressValue,
+      portRemote,
+      rawClientData: view.slice(portIndex + 4),
+      version: null
+    };
   } catch (e) { return { hasError: true }; }
 }
 
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, proxy) {
+async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader) {
   try {
-    // KUNCI PERBAIKAN: Hanya ganti IP tujuan (targetHost).
-    // Port harus SELALU menggunakan port tujuan asli (portRemote) seperti standar edgetunnel.
-    let targetHost = proxy ? proxy.ip : addressRemote;
-    let targetPort = portRemote; 
-
-    const tcpSocket = connect({ hostname: targetHost, port: targetPort });
+    const tcpSocket = connect({ hostname: addressRemote, port: portRemote });
     remoteSocket.value = tcpSocket;
     const writer = tcpSocket.writable.getWriter();
     await writer.write(rawClientData);
@@ -273,16 +345,17 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
   }
 }
 
-
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
   let readableStreamCancel = false;
   return new ReadableStream({
     start(controller) {
       webSocketServer.addEventListener("message", (event) => {
-        if (!readableStreamCancel) controller.enqueue(event.data);
+        if (readableStreamCancel) return;
+        controller.enqueue(event.data);
       });
       webSocketServer.addEventListener("close", () => {
-        if (!readableStreamCancel) controller.close();
+        if (readableStreamCancel) return;
+        controller.close();
       });
       webSocketServer.addEventListener("error", (err) => controller.error(err));
 
@@ -290,7 +363,8 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
         try {
           const parts = earlyDataHeader.split(",");
           const base64Str = (parts.length > 1 ? parts[1].trim() : parts[0].trim()).replace(/-/g, "+").replace(/_/g, "/");
-          controller.enqueue(Uint8Array.from(atob(base64Str), (c) => c.charCodeAt(0)));
+          const decode = atob(base64Str);
+          controller.enqueue(Uint8Array.from(decode, (c) => c.charCodeAt(0)));
         } catch (e) {}
       }
     },
