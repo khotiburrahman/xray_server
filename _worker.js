@@ -246,8 +246,10 @@ function readHorseHeader(viewAll) {
 
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader, proxy) {
   try {
+    // KUNCI PERBAIKAN: Hanya ganti IP tujuan (targetHost).
+    // Port harus SELALU menggunakan port tujuan asli (portRemote) seperti standar edgetunnel.
     let targetHost = proxy ? proxy.ip : addressRemote;
-    let targetPort = proxy ? (proxy.port || portRemote) : portRemote;
+    let targetPort = portRemote; 
 
     const tcpSocket = connect({ hostname: targetHost, port: targetPort });
     remoteSocket.value = tcpSocket;
@@ -270,6 +272,7 @@ async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawCli
     if (webSocket.readyState === 1) webSocket.close();
   }
 }
+
 
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
   let readableStreamCancel = false;
