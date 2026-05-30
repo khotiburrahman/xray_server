@@ -121,7 +121,8 @@ async function getCachedData() {
         };
       }
       return null;
-    }).filter(Boolean);
+    }).filter(Boolean)
+      .filter(p => ["SG", "ID", "MY"].includes(p.cc.toUpperCase()));
 
   const domains = dText.split("\n")
     .map(l => l.trim().toLowerCase())
