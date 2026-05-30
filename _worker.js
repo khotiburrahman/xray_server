@@ -1,7 +1,7 @@
 import { connect } from "cloudflare:sockets";
 
 const PROXY_LIST_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/active_proxies.txt";
-const BLOCKED_DOMAIN_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/blocked_domain.txt";
+const BYPASS_DOMAIN_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/blocked_domain.txt";
 
 export default {
   async fetch(request) {
@@ -9,26 +9,23 @@ export default {
       const upgradeHeader = request.headers.get("Upgrade");
       const url = new URL(request.url);
 
-      // Fitur Sinkronisasi Manual
       if (url.pathname === "/sync") {
         const syncResult = await forceSync();
         return new Response(`Sync Berhasil!\n\n${syncResult}`, { status: 200 });
       }
 
-      // Ambil data dari Cache atau Fetch baru
       const rawProxies = await getCachedData(PROXY_LIST_URL, "proxy-cache");
-      const rawDomains = await getCachedData(BLOCKED_DOMAIN_URL, "domain-cache");
+      const rawDomains = await getCachedData(BYPASS_DOMAIN_URL, "domain-cache");
 
       const proxies = parseProxyList(rawProxies);
-      const blockedDomains = parseBlockedDomains(rawDomains);
+      const bypassDomains = parseBypassDomains(rawDomains);
 
       if (upgradeHeader === "websocket") {
-        return await websocketHandler(request, proxies, blockedDomains, url.pathname);
+        return await websocketHandler(request, proxies, bypassDomains, url.pathname);
       }
       
-      // Tampilan Dashboard di root (/)
       if (url.pathname === "/") {
-        return new Response(generateDashboard(proxies, blockedDomains), { 
+        return new Response(generateDashboard(proxies, bypassDomains), { 
           status: 200,
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
@@ -41,7 +38,6 @@ export default {
   }
 };
 
-// --- Fungsi Cache & Fetch ---
 async function getCachedData(targetUrl, cacheKeyName, force = false) {
   const cache = caches.default;
   const cacheKey = new Request(`https://fake-host.local/${cacheKeyName}`);
@@ -56,30 +52,26 @@ async function getCachedData(targetUrl, cacheKeyName, force = false) {
     if (req.ok) {
       const text = await req.text();
       const responseToCache = new Response(text, {
-        headers: { "Cache-Control": "public, max-age=3600" } // Cache 1 Jam
+        headers: { "Cache-Control": "public, max-age=3600" } 
       });
       await cache.put(cacheKey, responseToCache);
       return text;
     }
-  } catch (e) {
-    // Jika fetch gagal dan force=true (atau belum ada cache), kembalikan string kosong
-  }
+  } catch (e) {}
   
-  // Fallback: coba ambil dari cache lama jika fetch gagal saat bukan force
   let staleResponse = await cache.match(cacheKey);
   return staleResponse ? await staleResponse.text() : "";
 }
 
 async function forceSync() {
   const p = await getCachedData(PROXY_LIST_URL, "proxy-cache", true);
-  const d = await getCachedData(BLOCKED_DOMAIN_URL, "domain-cache", true);
+  const d = await getCachedData(BYPASS_DOMAIN_URL, "domain-cache", true);
   
   const proxyCount = parseProxyList(p).length;
-  const domainCount = parseBlockedDomains(d).length;
-  return `Total Proxy Diperbarui: ${proxyCount}\nTotal Domain Diblokir Diperbarui: ${domainCount}`;
+  const domainCount = parseBypassDomains(d).length;
+  return `Total Proxy Diperbarui: ${proxyCount}\nTotal Domain Dialihkan Diperbarui: ${domainCount}`;
 }
 
-// --- Fungsi Parsing ---
 function parseProxyList(text) {
   if (!text) return [];
   return text.split('\n')
@@ -91,37 +83,44 @@ function parseProxyList(text) {
     });
 }
 
-function parseBlockedDomains(text) {
+function parseBypassDomains(text) {
   if (!text) return [];
   return text.split('\n')
     .map(line => line.trim().toLowerCase())
-    .filter(line => line && !line.startsWith('#')); // Abaikan baris kosong & komentar
+    .filter(line => line && !line.startsWith('#')); 
 }
 
-// --- Fungsi Dashboard HTML ---
 function generateDashboard(proxies, domains) {
-  let html = `<html><head><title>Dashboard Proxy & Domain</title><style>body{font-family:sans-serif;padding:20px}table{border-collapse:collapse;width:100%;margin-bottom:20px}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background-color:#f2f2f2}</style></head><body>`;
+  let html = `<html><head><title>Dashboard Proxy & Pengalihan</title><style>body{font-family:sans-serif;padding:20px}table{border-collapse:collapse;width:100%;margin-bottom:20px}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background-color:#f2f2f2}</style></head><body>`;
   html += `<h2>Dashboard Kaftakahira</h2>`;
-  html += `<p>Total Proxy: <b>${proxies.length}</b> | Total Domain Diblokir: <b>${domains.length}</b></p>`;
+  html += `<p>Total Proxy: <b>${proxies.length}</b> | Total Domain Dialihkan: <b>${domains.length}</b></p>`;
   html += `<p><a href="/sync" target="_blank"><button style="padding:10px;cursor:pointer;">Sync Data Sekarang</button></a></p>`;
   
   html += `<h3>Daftar Proxy Aktif</h3>`;
-  html += `<table><tr><th>IP</th><th>Port</th><th>Kode Negara</th><th>ISP / Org</th></tr>`;
-  proxies.forEach(p => {
-    html += `<tr><td>${p.ip}</td><td>${p.port}</td><td>${p.cc}</td><td>${p.org}</td></tr>`;
-  });
-  html += `</table>`;
+  if (proxies.length === 0) {
+    html += `<p><i>Tidak ada proxy aktif saat ini.</i></p>`;
+  } else {
+    html += `<table><tr><th>IP</th><th>Port</th><th>Kode Negara</th><th>ISP / Org</th></tr>`;
+    proxies.forEach(p => {
+      html += `<tr><td>${p.ip}</td><td>${p.port}</td><td>${p.cc}</td><td>${p.org}</td></tr>`;
+    });
+    html += `</table>`;
+  }
 
-  html += `<h3>Daftar Domain Auto-Bypass</h3>`;
-  html += `<div style="column-count:3;font-size:14px;"><ul>`;
-  domains.forEach(d => { html += `<li>${d}</li>`; });
-  html += `</ul></div></body></html>`;
+  html += `<h3>Daftar Domain Dialihkan (Auto-Proxy)</h3>`;
+  if (domains.length === 0) {
+    html += `<p><i>Tidak ada domain yang diatur untuk dialihkan saat ini.</i></p>`;
+  } else {
+    html += `<div style="column-count:3;font-size:14px;"><ul>`;
+    domains.forEach(d => { html += `<li>${d}</li>`; });
+    html += `</ul></div>`;
+  }
+  html += `</body></html>`;
   
   return html;
 }
 
-// --- Fungsi Handler Websocket & Protokol ---
-async function websocketHandler(request, proxies, blockedDomains, pathname) {
+async function websocketHandler(request, proxies, bypassDomains, pathname) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
@@ -149,17 +148,18 @@ async function websocketHandler(request, proxies, blockedDomains, pathname) {
         return;
       }
 
-      // Logic Penentuan Proxy menggunakan dynamic blockedDomains
       let selectedProxy = null;
       const requestedCC = pathname.replace('/', '').toUpperCase();
-      const isBlockedTarget = blockedDomains.some(domain => headerData.addressRemote.toLowerCase().includes(domain));
+      const isBypassTarget = bypassDomains.some(domain => headerData.addressRemote.toLowerCase().includes(domain));
 
+      // PERBAIKAN LOGIKA DI SINI
       if (requestedCC && requestedCC !== "" && requestedCC !== "SYNC") {
-        const filteredProxies = proxies.filter(p => p.cc.includes(requestedCC));
+        // Cek apakah input (misal SG1) diawali dengan kode proxy (misal SG)
+        const filteredProxies = proxies.filter(p => requestedCC.startsWith(p.cc));
         if (filteredProxies.length > 0) {
           selectedProxy = filteredProxies[Math.floor(Math.random() * filteredProxies.length)];
         }
-      } else if (isBlockedTarget && proxies.length > 0) {
+      } else if (isBypassTarget && proxies.length > 0) {
         selectedProxy = proxies[Math.floor(Math.random() * proxies.length)];
       }
 
