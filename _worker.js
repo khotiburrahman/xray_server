@@ -3,38 +3,56 @@ import { connect } from "cloudflare:sockets";
 const DEFAULT_UUID = "00000000-0000-0000-0000-000000000000"; 
 const GITHUB_PROXY_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/active_proxies.txt";
 
+// Variabel internal untuk menyimpan cache di RAM Worker
+let GLOBAL_PROXY_CACHE = null;
+let LAST_CACHE_TIME = 0;
+
 export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       const path = url.pathname.toLowerCase();
       const finalUUID = env.UUID || DEFAULT_UUID;
+      const currentTime = Date.now();
 
-      // 1. LIVE FETCH: Mengambil data proxy dari GitHub dengan Cache 1 Jam
-      let proxyList = [];
-      try {
-        const response = await fetch(GITHUB_PROXY_URL, { 
-          headers: { "User-Agent": "Cloudflare Worker" },
-          cf: { cacheEverything: true, cacheTtl: 3600 } 
-        });
-        if (response.status === 200) {
-          const text = await response.text();
-          const lines = text.split("\n").filter(Boolean);
-          for (const line of lines) {
-            const parts = line.split(",");
-            if (parts.length >= 2) {
-              proxyList.push({ 
-                prxIP: parts[0].trim(), 
-                prxPort: parts[1].trim(), 
-                country: parts[2] ? parts[2].trim() : "UN", 
-                org: parts[3] ? parts[3].trim() : "Unknown" 
-              });
+      // 1. MEMORY CACHE LOGIC: Ambil dari RAM jika belum lewat 1 jam (3600000 ms)
+      if (!GLOBAL_PROXY_CACHE || (currentTime - LAST_CACHE_TIME > 3600000)) {
+        try {
+          const response = await fetch(GITHUB_PROXY_URL, { 
+            headers: { "User-Agent": "Cloudflare Worker" },
+            cf: { cacheEverything: true, cacheTtl: 3600 } 
+          });
+          
+          if (response.status === 200) {
+            const text = await response.text();
+            const lines = text.split("\n").filter(Boolean);
+            const tempValues = [];
+
+            for (const line of lines) {
+              const parts = line.split(",");
+              if (parts.length >= 2) {
+                tempValues.push({ 
+                  prxIP: parts[0].trim(), 
+                  prxPort: parts[1].trim(), 
+                  country: parts[2] ? parts[2].trim() : "UN", 
+                  org: parts[3] ? parts[3].trim() : "Unknown" 
+                });
+              }
+            }
+            
+            // Simpan ke RAM Worker jika sukses parsing
+            if (tempValues.length > 0) {
+              GLOBAL_PROXY_CACHE = tempValues;
+              LAST_CACHE_TIME = currentTime;
             }
           }
+        } catch (e) {
+          // Jika gagal, biarkan menggunakan cache lama yang ada di RAM
         }
-      } catch (e) {
-        // Abaikan jika github bermasalah
       }
+
+      // Gunakan data dari RAM (Sangat cepat, hemat waktu CPU < 1ms)
+      const proxyList = GLOBAL_PROXY_CACHE || [];
 
       const countryPathMatch = url.pathname.match(/^\/([a-zA-Z]{2})(\d*)$/);
       const isUpgrade = request.headers.get("Upgrade")?.toLowerCase() === "websocket" || 
@@ -74,10 +92,10 @@ export default {
         });
       }
 
-      // Halaman Utama: List Proxy Terurai
+      // Halaman Utama: List Proxy
       if (path === "/") {
         if (proxyList.length === 0) {
-          return new Response("Gagal memuat data dari GitHub atau data kosong.", { status: 500 });
+          return new Response("Gagal memuat data dari memori. Sila refresh halaman.", { status: 500 });
         }
         const viewLines = [];
         const countryCounter = {};
@@ -110,11 +128,9 @@ async function multiProtocolHandler(request) {
 
   let remoteSocket = null;
 
-  // Membuat penanganan aliran data byte stream yang aman untuk WebSocket
   const readableStream = new ReadableStream({
     start(controller) {
       webSocket.addEventListener("message", event => {
-        // PROTEKSI: Memastikan data yang dimasukkan ke stream diubah ke Uint8Array murni
         let data = event.data;
         if (typeof data === "string") {
           data = new TextEncoder().encode(data);
@@ -132,7 +148,6 @@ async function multiProtocolHandler(request) {
 
   readableStream.pipeTo(new WritableStream({
     async write(chunk) {
-      // Pastikan chunk dalam format Uint8Array murni sebelum dikirim ke socket outbound
       const buffer = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
 
       if (remoteSocket) {
@@ -165,11 +180,9 @@ async function multiProtocolHandler(request) {
           webSocket.send(new Uint8Array([0, 0, 0x0d, 0x0a])); 
         }
 
-        // Jalankan pompa data balik dari proxy server ke client WebSocket
         remoteSocket.readable.pipeTo(new WritableStream({
           async write(data) {
             if (webSocket.readyState === 1) {
-              // Konversi ke ArrayBuffer sebelum dilempar balik ke v2rayNG lewat WebSocket
               const arrayBuffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
               webSocket.send(arrayBuffer);
             }
@@ -205,7 +218,7 @@ function generateSubscription(proxyList, uuid, host) {
     const nameTag = `${prx.org.toUpperCase()} [${prx.country.toUpperCase()}-${countryCounter[cc]}]`;
 
     result.push(`vless://${uuid}@${host}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=${encodeURIComponent(pathWS)}#VLESS-WS ${nameTag}`);
-    result.push(`vless://${uuid}@${host}:443?encryption=none&security=tls&sni=${host}&type=httpupgrade&host=${host}&path=${encodeURIComponent(pathWS)}#VLESS-HttpUpgrade ${nameTag}`);
+    result.push(`vless://${uuid}@${host}:443?encryption=none&security=tls&sni=${host}&type=httpupgrade&host=%${host}&path=${encodeURIComponent(pathWS)}#VLESS-HttpUpgrade ${nameTag}`);
     result.push(`trojan://${uuid}@${host}:443?security=tls&sni=${host}&type=ws&host=${host}&path=${encodeURIComponent(pathWS)}#TROJAN-WS ${nameTag}`);
     result.push(`trojan://${uuid}@${host}:443?security=tls&sni=${host}&type=httpupgrade&host=${host}&path=${encodeURIComponent(pathWS)}#TROJAN-HttpUpgrade ${nameTag}`);
 
