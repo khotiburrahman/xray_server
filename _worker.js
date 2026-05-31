@@ -1,6 +1,5 @@
 import { connect } from "cloudflare:sockets";
 
-const PROXY_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/active_proxies.txt";
 const BLOCKED_DOMAINS_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/blocked_domain.txt";
 
 export default {
@@ -9,127 +8,101 @@ export default {
       const url = new URL(request.url);
       const upgradeHeader = request.headers.get("Upgrade");
 
-      // 1. Endpoint Sinkronisasi Data
+      // 1. Endpoint Sinkronisasi (Hanya untuk Routing Domain)
       if (url.pathname === "/sync") {
         return await handleSync(ctx);
       }
 
-      // 2. Halaman Dashboard
+      // 2. Halaman Dashboard Teks
       if (url.pathname === "/" && upgradeHeader !== "websocket") {
         return await handleDashboard();
       }
 
-      // 3. Routing WebSocket
+      // 3. Routing Jalur VLESS & Trojan WebSocket
       if (upgradeHeader === "websocket") {
         return await websocketHandler(request, ctx);
       }
 
-      return new Response("Worker VLESS & Trojan Direct Aktif.", { status: 200 });
+      return new Response("Worker VLESS & Trojan Direct (KV Mode) Aktif.", { status: 200 });
     } catch (err) {
       return new Response(`Error: ${err.toString()}`, { status: 500 });
     }
   },
 
-  // Fungsi tambahan untuk update otomatis via Cron Triggers
+  // Sinkronisasi otomatis via Cron Triggers
   async scheduled(event, env, ctx) {
     await handleSync(ctx);
   }
 };
 
-// --- FUNGSI CACHE & SYNC ---
+// --- FUNGSI ROUTING & AMBIL DATA (KV DATABASE) ---
 
 async function handleSync(ctx) {
-  const cache = caches.default;
-  const reqProxy = new Request(PROXY_URL);
-  const reqDomain = new Request(BLOCKED_DOMAINS_URL);
+  if (typeof PROXY_DB === "undefined") {
+    return new Response(JSON.stringify({
+      status: "Gagal",
+      error: "Binding PROXY_DB tidak ditemukan di dashboard Cloudflare Anda."
+    }, null, 2), { headers: { "Content-Type": "application/json" } });
+  }
 
-  let pStatus = "Gagal (Menggunakan cache lama)";
+  const cache = caches.default;
+  const reqDomain = new Request(BLOCKED_DOMAINS_URL);
   let dStatus = "Gagal (Menggunakan cache lama)";
 
-  // Update Proxy
-  try {
-    const resProxy = await fetch(PROXY_URL);
-    if (resProxy.ok) {
-      const newProxyText = await resProxy.text();
-      const oldProxy = await cache.match(reqProxy);
-      const oldProxyText = oldProxy ? await oldProxy.text() : "";
-
-      if (newProxyText.trim().length > 0) {
-        if (newProxyText !== oldProxyText) {
-          const cacheResp = new Response(newProxyText, { headers: { "Cache-Control": "max-age=31536000" } });
-          ctx.waitUntil(cache.put(reqProxy, cacheResp));
-          pStatus = "Berhasil diperbarui";
-        } else {
-          pStatus = "Identik (Menggunakan cache lama)";
-        }
-      }
-    }
-  } catch (e) {}
-
-  // Update Domain
   try {
     const resDomain = await fetch(BLOCKED_DOMAINS_URL);
     if (resDomain.ok) {
       const newDomainText = await resDomain.text();
-      const oldDomain = await cache.match(reqDomain);
-      const oldDomainText = oldDomain ? await oldDomain.text() : "";
-
-      if (newDomainText !== oldDomainText) {
-        // Tetap simpan meskipun kosong
-        const cacheResp = new Response(newDomainText, { headers: { "Cache-Control": "max-age=31536000" } });
-        ctx.waitUntil(cache.put(reqDomain, cacheResp));
-        dStatus = "Berhasil diperbarui";
-      } else {
-        dStatus = "Identik (Menggunakan cache lama)";
-      }
+      const cacheResp = new Response(newDomainText, { headers: { "Cache-Control": "max-age=31536000" } });
+      ctx.waitUntil(cache.put(reqDomain, cacheResp));
+      dStatus = "Berhasil diperbarui";
     }
   } catch (e) {}
 
   return new Response(JSON.stringify({
-    proxy_status: pStatus,
+    kv_database: "PROXY_DB Terhubung",
     domain_status: dStatus
-  }, null, 2), {
-    headers: { "Content-Type": "application/json" }
-  });
+  }, null, 2), { headers: { "Content-Type": "application/json" } });
 }
 
 async function getCachedData() {
-  const cache = caches.default;
-  let pText = "", dText = "";
+  let proxies = [];
+  let dText = "";
 
-  const pCache = await cache.match(new Request(PROXY_URL));
-  if (pCache) pText = await pCache.text();
-  else {
-    const r = await fetch(PROXY_URL);
-    if (r.ok) pText = await r.text();
+  // Parsing JSON dari KV PROXY_DB (Filter ID, MY, SG)
+  if (typeof PROXY_DB !== "undefined") {
+    try {
+      const rawKvData = await PROXY_DB.get("ALL_ACTIVE_PROXIES");
+      if (rawKvData) {
+        const jsonProxy = JSON.parse(rawKvData);
+        for (const [key, value] of Object.entries(jsonProxy)) {
+          const countryCode = key.substring(0, 2).toUpperCase();
+          if (["ID", "MY", "SG"].includes(countryCode)) {
+            const splitValue = value.split("-");
+            if (splitValue.length === 2) {
+              proxies.push({
+                ip: splitValue[0].trim(),
+                port: splitValue[1].trim(),
+                cc: countryCode,
+                org: "KV Database"
+              });
+            }
+          }
+        }
+      }
+    } catch (e) {}
   }
 
+  // Ambil data domain blocked dari cache lokal
+  const cache = caches.default;
   const dCache = await cache.match(new Request(BLOCKED_DOMAINS_URL));
   if (dCache) dText = await dCache.text();
   else {
-    const r = await fetch(BLOCKED_DOMAINS_URL);
-    if (r.ok) dText = await r.text();
+    try {
+      const r = await fetch(BLOCKED_DOMAINS_URL);
+      if (r.ok) dText = await r.text();
+    } catch (e) {}
   }
-
-  // Format array proxy & domain
-  const proxies = pText.split("\n")
-    .map(l => l.trim())
-    .filter(l => l.length > 0)
-    .map(l => {
-      const parts = l.split(",");
-      if (parts.length >= 3) {
-        return {
-          ip: parts[0],
-          port: parts[1],
-          cc: parts[2],
-          org: parts.slice(3).join(",") || "Unknown"
-        };
-      }
-      return null;
-    })
-    .filter(Boolean)
-    // Filter negara ditambahkan di sini
-    .filter(p => ["SG", "ID", "MY"].includes(p.cc.toUpperCase()));
 
   const domains = dText.split("\n")
     .map(l => l.trim().toLowerCase())
@@ -142,13 +115,17 @@ async function getCachedData() {
 
 async function handleDashboard() {
   const { proxies, domains } = await getCachedData();
-  let output = "";
+  let output = "DAFTAR PROXY AKTIF (KV SYSTEM - ID/MY/SG):\n=======================================\n";
+  
+  if (proxies.length === 0) {
+    output += "(Kosong - Tidak ada proxy ID/MY/SG aktif di KV DB)\n";
+  } else {
+    proxies.forEach(p => {
+      output += `[${p.cc}] ${p.ip}:${p.port}\n`;
+    });
+  }
 
-  proxies.forEach(p => {
-    output += `${p.cc} ${p.ip} ${p.port} ${p.org}\n`;
-  });
-
-  output += "\n=======================\nDOMAIN YANG DI-ROUTE:\n=======================\n";
+  output += "\n=======================\nDOMAIN YANG DI-ROUTE VIA PROXY:\n=======================\n";
   if (domains.length === 0) {
     output += "(Kosong - Semua rute ditangani langsung oleh Cloudflare)\n";
   } else {
