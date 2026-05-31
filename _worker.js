@@ -2,7 +2,7 @@ import { connect } from "cloudflare:sockets";
 
 // IP Proxy Cloudflare default untuk bypass jika diperlukan (opsional).
 // Jika ingin koneksi langsung, biarkan string kosong "".
-const DEFAULT_PROXY_IP = "cdn.anycast.eu.org"; 
+const DEFAULT_PROXY_IP = ""; 
 
 export default {
   async fetch(request) {
