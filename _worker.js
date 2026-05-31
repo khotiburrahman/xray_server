@@ -23,33 +23,24 @@ export default {
       }
 
       const finalUUID = env.UUID || DEFAULT_UUID;
-      
-      // Deteksi path biasa (seperti /sg1, /id2) ATAU path /cf
-      const countryPathMatch = url.pathname.match(/^\/([a-zA-Z]{2})(\d*)$/);
+      const countryPathMatch = url.pathname.match(/^\/([a-zA-Z]{2})(\d+)$/);
       
       if (countryPathMatch && request.headers.get("Upgrade") === "websocket") {
         const targetCountry = countryPathMatch[1].toUpperCase();
-        const targetIndex = parseInt(countryPathMatch[2]) - 1 || 0;
+        const targetIndex = parseInt(countryPathMatch[2]) - 1;
 
-        // 1. LOGIKA KHUSUS JIKA PATH ADALAH /CF
-        if (targetCountry === "CF") {
-          globalThis.PROXY_IP = "1.1.1.1"; // Menembak Cloudflare Anycast IP sendiri
-          globalThis.PROXY_PORT = "443";
+        const filteredProxies = proxyList.filter(p => p.country.toUpperCase() === targetCountry);
+        let selectedProxy = null;
+        if (filteredProxies.length > 0) {
+          selectedProxy = filteredProxies[targetIndex] || filteredProxies[targetIndex % filteredProxies.length];
+        }
+
+        if (selectedProxy) {
+          globalThis.PROXY_IP = selectedProxy.prxIP;
+          globalThis.PROXY_PORT = selectedProxy.prxPort;
         } else {
-          // Logika pencarian proxy normal berdasarkan data GitHub
-          const filteredProxies = proxyList.filter(p => p.country.toUpperCase() === targetCountry);
-          let selectedProxy = null;
-          if (filteredProxies.length > 0) {
-            selectedProxy = filteredProxies[targetIndex] || filteredProxies[targetIndex % filteredProxies.length];
-          }
-
-          if (selectedProxy) {
-            globalThis.PROXY_IP = selectedProxy.prxIP;
-            globalThis.PROXY_PORT = selectedProxy.prxPort;
-          } else {
-            globalThis.PROXY_IP = "1.1.1.1";
-            globalThis.PROXY_PORT = "443";
-          }
+          globalThis.PROXY_IP = "1.1.1.1";
+          globalThis.PROXY_PORT = "443";
         }
 
         return await websocketHandler(request, finalUUID);
@@ -63,7 +54,7 @@ export default {
         });
       }
 
-      return new Response(`EdTunnel Mini Terbuka.\nSub: https://${url.hostname}/sub\nPath: /cf, /sg1, /id1, /my1`, {
+      return new Response(`EdTunnel Mini Terbuka.\nSub: https://${url.hostname}/sub\nPath: /sg1, /id1, /my1`, {
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8" }
       });
@@ -113,17 +104,12 @@ async function syncProxiesToCache(env) {
     await env.PROXY_DB.put("HOMEPAGE_CACHE", text);
     return { status: "success", total: proxies.length };
   } catch (err) {
-    return { status: "failed", message: `Gagal memperbarui. Error: ${err.message}` };
+    return { status: "failed", message: `Gagal memperbarui. Menggunakan data lama. Error: ${err.message}` };
   }
 }
 
 function generateSubscription(proxyList, uuid, host) {
   const result = [];
-  
-  // Masukkan node Cloudflare murni di urutan paling atas sub
-  const cfLink = `vless://${uuid}@${host}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=${encodeURIComponent("/cf")}#Cloudflare Anycast Proxy [CF]`;
-  result.push(cfLink);
-
   const countryCounter = {};
   for (const prx of proxyList) {
     const cc = prx.country.toLowerCase();
@@ -142,6 +128,7 @@ async function websocketHandler(request, uuid) {
   webSocket.accept();
 
   let remoteSocket = null;
+  let isFirstChunk = true;
 
   const readableStream = new ReadableStream({
     start(controller) {
@@ -160,16 +147,22 @@ async function websocketHandler(request, uuid) {
         return;
       }
 
+      // Validasi & Parsing Header VLESS asli (Ciri khas EdTunnel stabil)
       const buffer = new Uint8Array(chunk);
-      if (buffer[0] !== 0) return safeClose(webSocket); 
+      if (buffer[0] !== 0) return safeClose(webSocket); // Versi VLESS harus 0
 
+      // Mengambil bagian data murni setelah header VLESS dilewati
+      // EdTunnel membuang info command/port bawaan client karena kita menggunakan IP hasil filter GitHub
       const targetIP = globalThis.PROXY_IP || "1.1.1.1";
       const targetPort = parseInt(globalThis.PROXY_PORT) || 443;
 
       try {
         remoteSocket = connect({ hostname: targetIP, port: targetPort });
+        
+        // Kirim VLESS response header standard (Kunci utama agar v2rayNG terhubung sukses)
         webSocket.send(new Uint8Array([0, 0])); 
 
+        // Jalankan pompa data dua arah
         remoteSocket.readable.pipeTo(new WritableStream({
           write(data) {
             if (webSocket.readyState === 1) webSocket.send(data);
