@@ -3,8 +3,11 @@ import { connect } from "cloudflare:sockets";
 export default {
   async fetch(request) {
     if (request.headers.get("Upgrade") !== "websocket") {
+      console.log("Request bukan WebSocket, menampilkan halaman status.");
       return new Response("VLESS/Trojan Worker is active.", { status: 200 });
     }
+    console.log("-----------------------------------------");
+    console.log("Request WebSocket diterima, memulai handler...");
     return await websocketHandler(request);
   }
 };
@@ -14,14 +17,19 @@ async function websocketHandler(request) {
   webSocket.accept();
   let remoteSocket = null;
 
-  // 1. Ekstrak "Early Data" (Sangat penting untuk V2rayNG/Clash)
+  // 1. Ekstrak "Early Data"
   let earlyData = null;
   const protocolHeader = request.headers.get("sec-websocket-protocol");
   if (protocolHeader) {
     try {
       const base64 = protocolHeader.replace(/-/g, "+").replace(/_/g, "/");
       earlyData = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-    } catch (e) {}
+      console.log(`[SUKSES] Early Data berhasil diekstrak (Panjang: ${earlyData.byteLength} bytes).`);
+    } catch (e) {
+      console.error(`[ERROR] Gagal mengekstrak Early Data: ${e.message}`);
+    }
+  } else {
+    console.log("[INFO] Tidak ada Early Data (sec-websocket-protocol kosong).");
   }
 
   let headerParsed = false;
@@ -30,33 +38,52 @@ async function websocketHandler(request) {
     start(controller) {
       if (earlyData) controller.enqueue(earlyData);
       webSocket.addEventListener("message", (e) => controller.enqueue(new Uint8Array(e.data)));
-      webSocket.addEventListener("close", () => { controller.close(); if (remoteSocket) remoteSocket.close(); });
-      webSocket.addEventListener("error", (e) => controller.error(e));
+      webSocket.addEventListener("close", () => { 
+        console.log("[INFO] Koneksi WebSocket ditutup oleh klien.");
+        controller.close(); 
+        if (remoteSocket) remoteSocket.close(); 
+      });
+      webSocket.addEventListener("error", (e) => {
+        console.error(`[ERROR] Terjadi error pada WebSocket klien.`);
+        controller.error(e);
+      });
     },
-    cancel() { webSocket.close(); }
+    cancel() { 
+      console.log("[INFO] Stream dibatalkan (Cancel).");
+      webSocket.close(); 
+    }
   });
 
   readable.pipeTo(new WritableStream({
     async write(chunk) {
+      // Jika sudah terhubung, langsung teruskan data ke target
       if (remoteSocket) {
-        const writer = remoteSocket.writable.getWriter();
-        await writer.write(chunk);
-        writer.releaseLock();
+        try {
+          const writer = remoteSocket.writable.getWriter();
+          await writer.write(chunk);
+          writer.releaseLock();
+        } catch (err) {
+          console.error(`[ERROR] Gagal menulis data ke target (remote socket): ${err.message}`);
+        }
         return;
       }
 
+      // Parsing header untuk koneksi pertama kali
       if (!headerParsed) {
         const buffer = new Uint8Array(chunk);
         let address = "", port = 0, rawDataIndex = 0, responseHeader = null;
+        let protocolName = "";
 
         try {
           // 2a. Sniff Trojan Header
           if (buffer.byteLength >= 58 && buffer[56] === 0x0d && buffer[57] === 0x0a) {
+            protocolName = "Trojan";
             const addrType = buffer[59];
             let addrIdx = 60, addrLen = 0;
+            
             if (addrType === 1) { addrLen = 4; address = buffer.slice(addrIdx, addrIdx + addrLen).join("."); } 
             else if (addrType === 3) { addrLen = buffer[addrIdx]; addrIdx++; address = new TextDecoder().decode(buffer.slice(addrIdx, addrIdx + addrLen)); } 
-            else if (addrType === 4) { addrLen = 16; address = "ipv6"; } // Disederhanakan
+            else if (addrType === 4) { addrLen = 16; address = "ipv6"; }
             
             const portIdx = addrIdx + addrLen;
             port = (buffer[portIdx] << 8) | buffer[portIdx + 1];
@@ -64,6 +91,7 @@ async function websocketHandler(request) {
           }
           // 2b. Sniff VLESS Header
           else if (buffer.byteLength >= 18 && buffer[0] === 0) {
+            protocolName = "VLESS";
             const optLen = buffer[17];
             const portIdx = 18 + optLen + 1;
             port = (buffer[portIdx] << 8) | buffer[portIdx + 1];
@@ -79,37 +107,55 @@ async function websocketHandler(request) {
             rawDataIndex = addrValIdx + addrLen;
             responseHeader = new Uint8Array([buffer[0], 0]);
           } else {
-            throw new Error("Protocol not recognized");
+            throw new Error("Protokol tidak dikenali atau data terlalu pendek.");
           }
         } catch (err) {
+          console.error(`[ERROR] Parsing header gagal: ${err.message}. Byte size: ${buffer.byteLength}`);
           webSocket.close();
           return;
         }
 
         headerParsed = true;
+        console.log(`[SUKSES] Parsing selesai! Protokol: ${protocolName} | Target: ${address}:${port}`);
 
-        // 3. Sambung ke tujuan asli (Langsung ke Google/Situs target, bukan diputar ke CDN)
-        remoteSocket = connect({ hostname: address, port: port });
-        const writer = remoteSocket.writable.getWriter();
-        await writer.write(buffer.slice(rawDataIndex));
-        writer.releaseLock();
+        // 3. Sambung ke tujuan asli
+        try {
+          console.log(`[INFO] Sedang menyambungkan TCP ke ${address}:${port}...`);
+          remoteSocket = connect({ hostname: address, port: port });
+          const writer = remoteSocket.writable.getWriter();
+          await writer.write(buffer.slice(rawDataIndex));
+          writer.releaseLock();
+          console.log(`[SUKSES] Terhubung ke ${address}:${port} dan data awal dikirim.`);
+        } catch (err) {
+          console.error(`[ERROR] Gagal menyambungkan ke TCP ${address}:${port} -> ${err.message}`);
+          webSocket.close();
+          return;
+        }
 
-        // 4. Kembalikan respons TCP dari target ke klien VPN
+        // 4. Kembalikan respons dari target ke klien VPN
         remoteSocket.readable.pipeTo(new WritableStream({
           async write(remoteChunk) {
             if (webSocket.readyState === 1) {
-              if (responseHeader) {
-                webSocket.send(await new Blob([responseHeader, remoteChunk]).arrayBuffer());
-                responseHeader = null;
-              } else {
-                webSocket.send(remoteChunk);
+              try {
+                if (responseHeader) {
+                  webSocket.send(await new Blob([responseHeader, remoteChunk]).arrayBuffer());
+                  responseHeader = null;
+                } else {
+                  webSocket.send(remoteChunk);
+                }
+              } catch (err) {
+                console.error(`[ERROR] Gagal mengirim balasan ke klien WebSocket: ${err.message}`);
               }
             }
           }
-        })).catch(() => {});
+        })).catch((err) => {
+          console.error(`[INFO/ERROR] Stream dari target ditutup/error: ${err.message}`);
+        });
       }
     }
-  })).catch(() => {});
+  })).catch((err) => {
+    console.error(`[ERROR] Stream WebSocket utama bermasalah: ${err.message}`);
+  });
 
   return new Response(null, { status: 101, webSocket: client });
 }
