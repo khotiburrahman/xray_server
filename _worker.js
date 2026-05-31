@@ -1,228 +1,191 @@
 import { connect } from "cloudflare:sockets";
 
+const DEFAULT_UUID = "00000000-0000-0000-0000-000000000000"; 
+const GITHUB_PROXY_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/active_proxies.txt";
+
 export default {
   async fetch(request, env, ctx) {
     try {
-      const upgradeHeader = request.headers.get("Upgrade");
+      const url = new URL(request.url);
+      const path = url.pathname.toLowerCase();
 
-      // Pastikan hanya memproses jika koneksi berupa WebSocket (VLESS / Trojan WS)
-      if (upgradeHeader === "websocket") {
-        return await websocketHandler(request);
+      if (path === "/sync-db") {
+        const syncResult = await syncProxiesToCache(env);
+        return new Response(JSON.stringify(syncResult), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
       }
 
-      return new Response("Worker VLESS & Trojan Direct Outbound Murni Aktif.", { status: 200 });
+      let proxyList = [];
+      if (env.PROXY_DB) {
+        proxyList = await env.PROXY_DB.get("PROXIES_JSON", "json") || [];
+      }
+
+      const finalUUID = env.UUID || DEFAULT_UUID;
+      
+      // Deteksi path biasa (seperti /sg1, /id2) ATAU path /cf
+      const countryPathMatch = url.pathname.match(/^\/([a-zA-Z]{2})(\d*)$/);
+      
+      if (countryPathMatch && request.headers.get("Upgrade") === "websocket") {
+        const targetCountry = countryPathMatch[1].toUpperCase();
+        const targetIndex = parseInt(countryPathMatch[2]) - 1 || 0;
+
+        // 1. LOGIKA KHUSUS JIKA PATH ADALAH /CF
+        if (targetCountry === "CF") {
+          globalThis.PROXY_IP = "1.1.1.1"; // Menembak Cloudflare Anycast IP sendiri
+          globalThis.PROXY_PORT = "443";
+        } else {
+          // Logika pencarian proxy normal berdasarkan data GitHub
+          const filteredProxies = proxyList.filter(p => p.country.toUpperCase() === targetCountry);
+          let selectedProxy = null;
+          if (filteredProxies.length > 0) {
+            selectedProxy = filteredProxies[targetIndex] || filteredProxies[targetIndex % filteredProxies.length];
+          }
+
+          if (selectedProxy) {
+            globalThis.PROXY_IP = selectedProxy.prxIP;
+            globalThis.PROXY_PORT = selectedProxy.prxPort;
+          } else {
+            globalThis.PROXY_IP = "1.1.1.1";
+            globalThis.PROXY_PORT = "443";
+          }
+        }
+
+        return await websocketHandler(request, finalUUID);
+      }
+
+      if (path === "/sub") {
+        const subContent = generateSubscription(proxyList, finalUUID, url.hostname);
+        return new Response(btoa(subContent), {
+          status: 200,
+          headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
+      }
+
+      return new Response(`EdTunnel Mini Terbuka.\nSub: https://${url.hostname}/sub\nPath: /cf, /sg1, /id1, /my1`, {
+        status: 200,
+        headers: { "Content-Type": "text/plain; charset=utf-8" }
+      });
+
     } catch (err) {
       return new Response(`Error: ${err.toString()}`, { status: 500 });
     }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(syncProxiesToCache(env));
   }
 };
 
-// --- WEBSOCKET & DIRECT OUTBOUND ROUTING ---
+async function syncProxiesToCache(env) {
+  if (!env.PROXY_DB) return { error: "Binding KV 'PROXY_DB' tidak ditemukan!" };
+  try {
+    const response = await fetch(GITHUB_PROXY_URL, { headers: { "User-Agent": "Cloudflare Worker" } });
+    if (response.status !== 200) throw new Error("Gagal mengambil data dari GitHub");
 
-async function websocketHandler(request) {
+    const text = await response.text();
+    if (!text.trim()) throw new Error("Data GitHub kosong");
+
+    const oldText = await env.PROXY_DB.get("HOMEPAGE_CACHE");
+    if (text === oldText) {
+      return { status: "skipped", message: "Data identik." };
+    }
+
+    const lines = text.split("\n").filter(Boolean);
+    const proxies = [];
+
+    for (const line of lines) {
+      const parts = line.split(",");
+      if (parts.length >= 2) {
+        proxies.push({ 
+          prxIP: parts[0].trim(), 
+          prxPort: parts[1].trim(), 
+          country: parts[2] ? parts[2].trim() : "UN", 
+          org: parts[3] ? parts[3].trim() : "Unknown" 
+        });
+      }
+    }
+
+    if (proxies.length === 0) throw new Error("Format tidak valid");
+
+    await env.PROXY_DB.put("PROXIES_JSON", JSON.stringify(proxies));
+    await env.PROXY_DB.put("HOMEPAGE_CACHE", text);
+    return { status: "success", total: proxies.length };
+  } catch (err) {
+    return { status: "failed", message: `Gagal memperbarui. Error: ${err.message}` };
+  }
+}
+
+function generateSubscription(proxyList, uuid, host) {
+  const result = [];
+  
+  // Masukkan node Cloudflare murni di urutan paling atas sub
+  const cfLink = `vless://${uuid}@${host}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=${encodeURIComponent("/cf")}#Cloudflare Anycast Proxy [CF]`;
+  result.push(cfLink);
+
+  const countryCounter = {};
+  for (const prx of proxyList) {
+    const cc = prx.country.toLowerCase();
+    if (!countryCounter[cc]) countryCounter[cc] = 0;
+    countryCounter[cc]++;
+    const vlessPath = `/${cc}${countryCounter[cc]}`;
+    const vlessLink = `vless://${uuid}@${host}:443?encryption=none&security=tls&sni=${host}&type=ws&host=${host}&path=${encodeURIComponent(vlessPath)}#${prx.org} [${prx.country.toUpperCase()}-${countryCounter[cc]}]`;
+    result.push(vlessLink);
+  }
+  return result.join("\n");
+}
+
+async function websocketHandler(request, uuid) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
 
-  let remoteSocketWrapper = { value: null };
-  const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
-  const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader);
+  let remoteSocket = null;
 
-  readableWebSocketStream.pipeTo(new WritableStream({
+  const readableStream = new ReadableStream({
+    start(controller) {
+      webSocket.addEventListener("message", event => controller.enqueue(event.data));
+      webSocket.addEventListener("close", () => safeClose(webSocket));
+      webSocket.addEventListener("error", () => safeClose(webSocket));
+    }
+  });
+
+  readableStream.pipeTo(new WritableStream({
     async write(chunk) {
-      let view;
-      if (chunk instanceof Uint8Array) view = chunk;
-      else if (chunk instanceof ArrayBuffer) view = new Uint8Array(chunk);
-      else if (typeof chunk === "string") view = new TextEncoder().encode(chunk);
-      else if (chunk && typeof chunk.arrayBuffer === "function") view = new Uint8Array(await chunk.arrayBuffer());
-      else view = new Uint8Array(chunk);
-
-      // Jika socket tujuan sudah terbuka, langsung teruskan data
-      if (remoteSocketWrapper.value) {
-        const writer = remoteSocketWrapper.value.writable.getWriter();
-        await writer.write(view);
+      if (remoteSocket) {
+        const writer = remoteSocket.writable.getWriter();
+        await writer.write(chunk);
         writer.releaseLock();
         return;
       }
 
-      // Sniffing protokol untuk membaca header data tujuan
-      const protocol = protocolSniffer(view);
-      let headerData = protocol === "trojan" ? readHorseHeader(view) : readNekoHeader(view);
+      const buffer = new Uint8Array(chunk);
+      if (buffer[0] !== 0) return safeClose(webSocket); 
 
-      if (headerData.hasError || !headerData.addressRemote) {
-        webSocket.close();
-        return;
+      const targetIP = globalThis.PROXY_IP || "1.1.1.1";
+      const targetPort = parseInt(globalThis.PROXY_PORT) || 443;
+
+      try {
+        remoteSocket = connect({ hostname: targetIP, port: targetPort });
+        webSocket.send(new Uint8Array([0, 0])); 
+
+        remoteSocket.readable.pipeTo(new WritableStream({
+          write(data) {
+            if (webSocket.readyState === 1) webSocket.send(data);
+          },
+          close() { safeClose(webSocket); },
+          abort() { safeClose(webSocket); }
+        }));
+      } catch (e) {
+        safeClose(webSocket);
       }
-
-      // Kirim koneksi murni DIRECT menggunakan jaringan Cloudflare ke tujuan asli
-      await handleTCPOutBound(
-        remoteSocketWrapper,
-        headerData.addressRemote,
-        headerData.portRemote,
-        headerData.rawClientData,
-        webSocket,
-        headerData.version
-      );
-    },
-    close() {},
-    abort() {},
+    }
   })).catch(() => {});
 
   return new Response(null, { status: 101, webSocket: client });
 }
 
-function protocolSniffer(view) {
-  if (view.length >= 58 && view[56] === 0x0d && view[57] === 0x0a) return "trojan";
-  return "vless";
-}
-
-// --- PARSING HEADER PROTOKOL ---
-
-function readNekoHeader(view) {
-  try {
-    if (view.length < 18) return { hasError: true };
-    const version = view[0];
-    const optLength = view[17];
-    const portIndex = 18 + optLength + 1; 
-
-    if (view.length < portIndex + 2) return { hasError: true };
-    const portRemote = (view[portIndex] << 8) | view[portIndex + 1];
-
-    let addressIndex = portIndex + 2;
-    const addressType = view[addressIndex];
-    let addressLength = 0, addressValueIndex = addressIndex + 1, addressValue = "";
-
-    switch (addressType) {
-      case 1:
-        addressLength = 4;
-        if (view.length < addressValueIndex + addressLength) return { hasError: true };
-        addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
-        break;
-      case 2:
-        addressLength = view[addressValueIndex];
-        addressValueIndex += 1;
-        if (view.length < addressValueIndex + addressLength) return { hasError: true };
-        addressValue = new TextDecoder().decode(view.slice(addressValueIndex, addressValueIndex + addressLength));
-        break;
-      case 3:
-        addressLength = 16;
-        if (view.length < addressValueIndex + addressLength) return { hasError: true };
-        const ipv6 = [];
-        for (let i = 0; i < 8; i++) ipv6.push(((view[addressValueIndex + i * 2] << 8) | view[addressValueIndex + i * 2 + 1]).toString(16));
-        addressValue = ipv6.join(":");
-        break;
-      default:
-        return { hasError: true };
-    }
-
-    return {
-      hasError: false,
-      addressRemote: addressValue,
-      portRemote,
-      rawClientData: view.slice(addressValueIndex + addressLength),
-      version: new Uint8Array([version, 0])
-    };
-  } catch (e) { return { hasError: true }; }
-}
-
-function readHorseHeader(viewAll) {
-  try {
-    if (viewAll.length < 58) return { hasError: true };
-    const view = viewAll.slice(58);
-    if (view.length < 4) return { hasError: true };
-
-    let addressType = view[1];
-    let addressLength = 0, addressValueIndex = 2, addressValue = "";
-
-    switch (addressType) {
-      case 1:
-        addressLength = 4;
-        if (view.length < addressValueIndex + addressLength) return { hasError: true };
-        addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
-        break;
-      case 3:
-        addressLength = view[addressValueIndex];
-        addressValueIndex += 1;
-        if (view.length < addressValueIndex + addressLength) return { hasError: true };
-        addressValue = new TextDecoder().decode(view.slice(addressValueIndex, addressValueIndex + addressLength));
-        break;
-      case 4:
-        addressLength = 16;
-        if (view.length < addressValueIndex + addressLength) return { hasError: true };
-        const ipv6 = [];
-        for (let i = 0; i < 8; i++) ipv6.push(((view[addressValueIndex + i * 2] << 8) | view[addressValueIndex + i * 2 + 1]).toString(16));
-        addressValue = ipv6.join(":");
-        break;
-      default:
-        return { hasError: true };
-    }
-
-    const portIndex = addressValueIndex + addressLength;
-    if (view.length < portIndex + 2) return { hasError: true };
-    const portRemote = (view[portIndex] << 8) | view[portIndex + 1];
-
-    return {
-      hasError: false,
-      addressRemote: addressValue,
-      portRemote,
-      rawClientData: view.slice(portIndex + 4),
-      version: null
-    };
-  } catch (e) { return { hasError: true }; }
-}
-
-// --- PENGIRIMAN DATA TCP (OUTBOUND) ---
-
-async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader) {
-  try {
-    const tcpSocket = connect({ hostname: addressRemote, port: portRemote });
-    remoteSocket.value = tcpSocket;
-    const writer = tcpSocket.writable.getWriter();
-    await writer.write(rawClientData);
-    writer.releaseLock();
-
-    if (responseHeader && webSocket.readyState === 1) {
-      webSocket.send(responseHeader);
-    }
-
-    tcpSocket.readable.pipeTo(new WritableStream({
-      write(chunk) {
-        if (webSocket.readyState === 1) webSocket.send(chunk);
-      }
-    })).catch(() => {
-      if (webSocket.readyState === 1) webSocket.close();
-    });
-  } catch (e) {
-    if (webSocket.readyState === 1) webSocket.close();
-  }
-}
-
-function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
-  let readableStreamCancel = false;
-  return new ReadableStream({
-    start(controller) {
-      webSocketServer.addEventListener("message", (event) => {
-        if (readableStreamCancel) return;
-        controller.enqueue(event.data);
-      });
-      webSocketServer.addEventListener("close", () => {
-        if (readableStreamCancel) return;
-        controller.close();
-      });
-      webSocketServer.addEventListener("error", (err) => controller.error(err));
-
-      if (earlyDataHeader) {
-        try {
-          const parts = earlyDataHeader.split(",");
-          const base64Str = (parts.length > 1 ? parts[1].trim() : parts[0].trim()).replace(/-/g, "+").replace(/_/g, "/");
-          const decode = atob(base64Str);
-          controller.enqueue(Uint8Array.from(decode, (c) => c.charCodeAt(0)));
-        } catch (e) {}
-      }
-    },
-    cancel() {
-      readableStreamCancel = true;
-      if (webSocketServer.readyState === 1) webSocketServer.close();
-    }
-  });
+function safeClose(ws) {
+  try { if (ws.readyState === 1 || ws.readyState === 2) ws.close(); } catch (e) {}
 }
