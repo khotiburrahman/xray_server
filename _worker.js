@@ -1,148 +1,25 @@
 import { connect } from "cloudflare:sockets";
 
-const BLOCKED_DOMAINS_URL = "https://raw.githubusercontent.com/khotiburrahman/auto_proxy/refs/heads/main/blocked_domain.txt";
-
 export default {
   async fetch(request, env, ctx) {
     try {
-      const url = new URL(request.url);
       const upgradeHeader = request.headers.get("Upgrade");
 
-      // 1. Endpoint Sinkronisasi (Hanya untuk Routing Domain)
-      if (url.pathname === "/sync") {
-        return await handleSync(ctx);
-      }
-
-      // 2. Halaman Dashboard Teks
-      if (url.pathname === "/" && upgradeHeader !== "websocket") {
-        return await handleDashboard();
-      }
-
-      // 3. Routing Jalur VLESS & Trojan WebSocket
+      // Pastikan hanya memproses jika koneksi berupa WebSocket (VLESS / Trojan WS)
       if (upgradeHeader === "websocket") {
-        return await websocketHandler(request, ctx);
+        return await websocketHandler(request);
       }
 
-      return new Response("Worker VLESS & Trojan Direct (KV Mode) Aktif.", { status: 200 });
+      return new Response("Worker VLESS & Trojan Direct Outbound Murni Aktif.", { status: 200 });
     } catch (err) {
       return new Response(`Error: ${err.toString()}`, { status: 500 });
     }
-  },
-
-  // Sinkronisasi otomatis via Cron Triggers
-  async scheduled(event, env, ctx) {
-    await handleSync(ctx);
   }
 };
 
-// --- FUNGSI ROUTING & AMBIL DATA (KV DATABASE) ---
+// --- WEBSOCKET & DIRECT OUTBOUND ROUTING ---
 
-async function handleSync(ctx) {
-  if (typeof PROXY_DB === "undefined") {
-    return new Response(JSON.stringify({
-      status: "Gagal",
-      error: "Binding PROXY_DB tidak ditemukan di dashboard Cloudflare Anda."
-    }, null, 2), { headers: { "Content-Type": "application/json" } });
-  }
-
-  const cache = caches.default;
-  const reqDomain = new Request(BLOCKED_DOMAINS_URL);
-  let dStatus = "Gagal (Menggunakan cache lama)";
-
-  try {
-    const resDomain = await fetch(BLOCKED_DOMAINS_URL);
-    if (resDomain.ok) {
-      const newDomainText = await resDomain.text();
-      const cacheResp = new Response(newDomainText, { headers: { "Cache-Control": "max-age=31536000" } });
-      ctx.waitUntil(cache.put(reqDomain, cacheResp));
-      dStatus = "Berhasil diperbarui";
-    }
-  } catch (e) {}
-
-  return new Response(JSON.stringify({
-    kv_database: "PROXY_DB Terhubung",
-    domain_status: dStatus
-  }, null, 2), { headers: { "Content-Type": "application/json" } });
-}
-
-async function getCachedData() {
-  let proxies = [];
-  let dText = "";
-
-  // Parsing JSON dari KV PROXY_DB (Filter ID, MY, SG)
-  if (typeof PROXY_DB !== "undefined") {
-    try {
-      const rawKvData = await PROXY_DB.get("ALL_ACTIVE_PROXIES");
-      if (rawKvData) {
-        const jsonProxy = JSON.parse(rawKvData);
-        for (const [key, value] of Object.entries(jsonProxy)) {
-          const countryCode = key.substring(0, 2).toUpperCase();
-          if (["ID", "MY", "SG"].includes(countryCode)) {
-            const splitValue = value.split("-");
-            if (splitValue.length === 2) {
-              proxies.push({
-                ip: splitValue[0].trim(),
-                port: splitValue[1].trim(),
-                cc: countryCode,
-                org: "KV Database"
-              });
-            }
-          }
-        }
-      }
-    } catch (e) {}
-  }
-
-  // Ambil data domain blocked dari cache lokal
-  const cache = caches.default;
-  const dCache = await cache.match(new Request(BLOCKED_DOMAINS_URL));
-  if (dCache) dText = await dCache.text();
-  else {
-    try {
-      const r = await fetch(BLOCKED_DOMAINS_URL);
-      if (r.ok) dText = await r.text();
-    } catch (e) {}
-  }
-
-  const domains = dText.split("\n")
-    .map(l => l.trim().toLowerCase())
-    .filter(l => l.length > 0 && !l.startsWith("#"));
-
-  return { proxies, domains };
-}
-
-// --- DASHBOARD ---
-
-async function handleDashboard() {
-  const { proxies, domains } = await getCachedData();
-  let output = "DAFTAR PROXY AKTIF (KV SYSTEM - ID/MY/SG):\n=======================================\n";
-  
-  if (proxies.length === 0) {
-    output += "(Kosong - Tidak ada proxy ID/MY/SG aktif di KV DB)\n";
-  } else {
-    proxies.forEach(p => {
-      output += `[${p.cc}] ${p.ip}:${p.port}\n`;
-    });
-  }
-
-  output += "\n=======================\nDOMAIN YANG DI-ROUTE VIA PROXY:\n=======================\n";
-  if (domains.length === 0) {
-    output += "(Kosong - Semua rute ditangani langsung oleh Cloudflare)\n";
-  } else {
-    domains.forEach(d => {
-      output += `${d}\n`;
-    });
-  }
-
-  return new Response(output, { 
-    status: 200, 
-    headers: { "Content-Type": "text/plain; charset=utf-8" } 
-  });
-}
-
-// --- WEBSOCKET & ROUTING CORE ---
-
-async function websocketHandler(request, ctx) {
+async function websocketHandler(request) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
   webSocket.accept();
@@ -160,6 +37,7 @@ async function websocketHandler(request, ctx) {
       else if (chunk && typeof chunk.arrayBuffer === "function") view = new Uint8Array(await chunk.arrayBuffer());
       else view = new Uint8Array(chunk);
 
+      // Jika socket tujuan sudah terbuka, langsung teruskan data
       if (remoteSocketWrapper.value) {
         const writer = remoteSocketWrapper.value.writable.getWriter();
         await writer.write(view);
@@ -167,6 +45,7 @@ async function websocketHandler(request, ctx) {
         return;
       }
 
+      // Sniffing protokol untuk membaca header data tujuan
       const protocol = protocolSniffer(view);
       let headerData = protocol === "trojan" ? readHorseHeader(view) : readNekoHeader(view);
 
@@ -175,22 +54,11 @@ async function websocketHandler(request, ctx) {
         return;
       }
 
-      const { proxies, domains } = await getCachedData();
-      let targetHost = headerData.addressRemote;
-      let targetPort = headerData.portRemote;
-
-      const isDomainBlocked = domains.some(domain => targetHost.toLowerCase().endsWith(domain));
-
-      if (isDomainBlocked && proxies.length > 0) {
-        const randomProxy = proxies[Math.floor(Math.random() * proxies.length)];
-        targetHost = randomProxy.ip;
-        targetPort = parseInt(randomProxy.port, 10);
-      }
-
+      // Kirim koneksi murni DIRECT menggunakan jaringan Cloudflare ke tujuan asli
       await handleTCPOutBound(
         remoteSocketWrapper,
-        targetHost,
-        targetPort,
+        headerData.addressRemote,
+        headerData.portRemote,
         headerData.rawClientData,
         webSocket,
         headerData.version
@@ -207,6 +75,8 @@ function protocolSniffer(view) {
   if (view.length >= 58 && view[56] === 0x0d && view[57] === 0x0a) return "trojan";
   return "vless";
 }
+
+// --- PARSING HEADER PROTOKOL ---
 
 function readNekoHeader(view) {
   try {
@@ -300,6 +170,8 @@ function readHorseHeader(viewAll) {
     };
   } catch (e) { return { hasError: true }; }
 }
+
+// --- PENGIRIMAN DATA TCP (OUTBOUND) ---
 
 async function handleTCPOutBound(remoteSocket, addressRemote, portRemote, rawClientData, webSocket, responseHeader) {
   try {
